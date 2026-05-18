@@ -1,0 +1,442 @@
+// Hospital Patient & Employee Satisfaction Survey Management System
+// MySQL Production Schema
+// Usage: Set DATABASE_URL in .env and run `bun run db:mysql:push`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// ROLES & PERMISSIONS
+// ============================================
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique @db.VarChar(50)
+  displayName String   @db.VarChar(100)
+  permissions String   @default("[]") @db.Text // JSON array of permission strings
+  description String?  @db.Text
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now()) @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @db.DateTime(3)
+
+  users User[]
+
+  @@index([name])
+  @@map("roles")
+}
+
+// ============================================
+// DEPARTMENTS
+// ============================================
+
+model Department {
+  id          String   @id @default(cuid())
+  name        String   @unique @db.VarChar(150)
+  code        String   @unique @db.VarChar(20)
+  description String?  @db.Text
+  headId      String?  @unique @db.VarChar(30) // User ID of department head
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @db.DateTime(3)
+
+  users        User[]
+  surveys      Survey[]
+  appointments Appointment[]
+  smsLogs      SmsLog[]
+  head         User?           @relation("DepartmentHead", fields: [headId], references: [id])
+
+  @@index([code])
+  @@index([isActive])
+  @@map("departments")
+}
+
+// ============================================
+// USERS
+// ============================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique @db.VarChar(255)
+  name          String    @db.VarChar(200)
+  password      String    @db.VarChar(255) // bcrypt hashed
+  phone         String?   @db.VarChar(30)
+  avatar        String?   @db.VarChar(500)
+  roleId        String    @db.VarChar(30)
+  departmentId  String?   @db.VarChar(30)
+  isActive      Boolean   @default(true)
+  isVerified    Boolean   @default(false)
+  lastLoginAt   DateTime? @db.DateTime(3)
+  createdAt     DateTime  @default(now()) @db.DateTime(3)
+  updatedAt     DateTime  @updatedAt @db.DateTime(3)
+  deletedAt     DateTime? @db.DateTime(3) // Soft delete
+
+  role            Role            @relation(fields: [roleId], references: [id])
+  department      Department?     @relation(fields: [departmentId], references: [id])
+  surveyResponses SurveyResponse[]
+  createdSurveys  Survey[]        @relation("SurveyCreator")
+  auditLogs       AuditLog[]
+  notifications   Notification[]
+  sessions        Session[]
+  attachments     Attachment[]
+  headedDepartment Department?    @relation("DepartmentHead")
+
+  @@index([email])
+  @@index([roleId])
+  @@index([departmentId])
+  @@index([isActive])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+// ============================================
+// SESSIONS
+// ============================================
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String   @db.VarChar(30)
+  token     String   @unique @db.VarChar(500)
+  device    String?  @db.VarChar(255)
+  ip        String?  @db.VarChar(45) // IPv6 compatible
+  expiresAt DateTime @db.DateTime(3)
+  createdAt DateTime @default(now()) @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ============================================
+// SURVEYS
+// ============================================
+
+model Survey {
+  id           String    @id @default(cuid())
+  title        String    @db.VarChar(300)
+  description  String?   @db.Text
+  type         String    @db.VarChar(20) // "PATIENT" | "EMPLOYEE"
+  isActive     Boolean   @default(true)
+  isAnonymous  Boolean   @default(false)
+  startDate    DateTime? @db.DateTime(3)
+  endDate      DateTime? @db.DateTime(3)
+  createdBy    String    @db.VarChar(30)
+  departmentId String?   @db.VarChar(30)
+  createdAt    DateTime  @default(now()) @db.DateTime(3)
+  updatedAt    DateTime  @updatedAt @db.DateTime(3)
+  deletedAt    DateTime? @db.DateTime(3)
+
+  creator      User              @relation("SurveyCreator", fields: [createdBy], references: [id])
+  department   Department?       @relation(fields: [departmentId], references: [id])
+  questions    SurveyQuestion[]
+  responses    SurveyResponse[]
+  smsTemplates SmsTemplate[]
+
+  @@index([type])
+  @@index([isActive])
+  @@index([createdBy])
+  @@index([departmentId])
+  @@index([deletedAt])
+  @@map("surveys")
+}
+
+model SurveyQuestion {
+  id           String   @id @default(cuid())
+  surveyId     String   @db.VarChar(30)
+  questionText String   @db.Text
+  questionType String   @db.VarChar(30) // "STAR_RATING" | "TEXT" | "MULTIPLE_CHOICE" | "YES_NO" | "DROPDOWN"
+  options      String   @default("[]") @db.Text // JSON array of options for MCQ/Dropdown
+  order        Int      @default(0)
+  isRequired   Boolean  @default(true)
+  category     String?  @db.VarChar(100) // e.g., "Cleanliness", "Staff Behavior", etc.
+  createdAt    DateTime @default(now()) @db.DateTime(3)
+  updatedAt    DateTime @updatedAt @db.DateTime(3)
+
+  survey    Survey          @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  answers   SurveyAnswer[]
+
+  @@index([surveyId])
+  @@index([questionType])
+  @@index([category])
+  @@map("survey_questions")
+}
+
+model SurveyResponse {
+  id            String    @id @default(cuid())
+  surveyId      String    @db.VarChar(30)
+  respondentId  String?   @db.VarChar(30) // null for anonymous
+  departmentId  String?   @db.VarChar(30)
+  status        String    @default("COMPLETED") @db.VarChar(20) // "COMPLETED" | "PARTIAL" | "ABANDONED"
+  isAnonymous   Boolean   @default(false)
+  overallRating Float?    @db.Double
+  submittedAt   DateTime  @default(now()) @db.DateTime(3)
+  createdAt     DateTime  @default(now()) @db.DateTime(3)
+
+  survey     Survey          @relation(fields: [surveyId], references: [id])
+  respondent User?           @relation(fields: [respondentId], references: [id])
+  answers    SurveyAnswer[]
+
+  @@index([surveyId])
+  @@index([respondentId])
+  @@index([departmentId])
+  @@index([status])
+  @@index([submittedAt])
+  @@index([overallRating])
+  @@map("survey_responses")
+}
+
+model SurveyAnswer {
+  id           String   @id @default(cuid())
+  responseId   String   @db.VarChar(30)
+  questionId   String   @db.VarChar(30)
+  answerText   String?  @db.Text // For text answers
+  answerNumber Float?   @db.Double // For star ratings
+  answerChoice String?  @db.VarChar(200) // For MCQ/YesNo/Dropdown selected option
+  createdAt    DateTime @default(now()) @db.DateTime(3)
+
+  response SurveyResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  question SurveyQuestion @relation(fields: [questionId], references: [id])
+
+  @@index([responseId])
+  @@index([questionId])
+  @@index([answerNumber])
+  @@map("survey_answers")
+}
+
+// ============================================
+// APPOINTMENTS
+// ============================================
+
+model Appointment {
+  id              String    @id @default(cuid())
+  patientName     String    @db.VarChar(200)
+  patientPhone    String    @db.VarChar(30)
+  patientEmail    String?   @db.VarChar(255)
+  departmentId    String    @db.VarChar(30)
+  doctorName      String?   @db.VarChar(200)
+  appointmentDate DateTime  @db.DateTime(3)
+  appointmentTime String?   @db.VarChar(10)
+  status          String    @default("SCHEDULED") @db.VarChar(20) // "SCHEDULED" | "COMPLETED" | "CANCELLED" | "NO_SHOW"
+  visitType       String?   @db.VarChar(20) // "OPD" | "IPD" | "EMERGENCY"
+  notes           String?   @db.Text
+  surveySent      Boolean   @default(false)
+  surveySentAt    DateTime? @db.DateTime(3)
+  createdAt       DateTime  @default(now()) @db.DateTime(3)
+  updatedAt       DateTime  @updatedAt @db.DateTime(3)
+
+  department Department @relation(fields: [departmentId], references: [id])
+
+  @@index([departmentId])
+  @@index([appointmentDate])
+  @@index([status])
+  @@index([surveySent])
+  @@map("appointments")
+}
+
+// ============================================
+// SMS MANAGEMENT
+// ============================================
+
+model SmsTemplate {
+  id        String   @id @default(cuid())
+  name      String   @db.VarChar(200)
+  content   String   @db.Text // Template with {{variable}} placeholders
+  variables String   @default("[]") @db.Text // JSON array of variable names
+  type      String   @db.VarChar(30) // "SURVEY" | "APPOINTMENT" | "REMINDER" | "CUSTOM"
+  category  String?  @db.VarChar(20) // "PATIENT" | "EMPLOYEE"
+  isActive  Boolean  @default(true)
+  surveyId  String?  @db.VarChar(30) // Link to survey for survey SMS
+  createdAt DateTime @default(now()) @db.DateTime(3)
+  updatedAt DateTime @updatedAt @db.DateTime(3)
+
+  survey    Survey?       @relation(fields: [surveyId], references: [id])
+  logs      SmsLog[]
+  campaigns SmsCampaign[]
+
+  @@index([type])
+  @@index([isActive])
+  @@index([surveyId])
+  @@map("sms_templates")
+}
+
+model SmsLog {
+  id             String    @id @default(cuid())
+  templateId     String?   @db.VarChar(30)
+  recipientName  String?   @db.VarChar(200)
+  recipientPhone String    @db.VarChar(30)
+  message        String    @db.Text
+  status         String    @default("PENDING") @db.VarChar(20) // "PENDING" | "SENT" | "DELIVERED" | "FAILED"
+  provider       String?   @db.VarChar(30) // "TWILIO" | "MSG91" | "TEXTLOCAL" | "CUSTOM"
+  providerMsgId  String?   @db.VarChar(100)
+  sentAt         DateTime? @db.DateTime(3)
+  deliveredAt    DateTime? @db.DateTime(3)
+  failureReason  String?   @db.Text
+  retryCount     Int       @default(0)
+  departmentId   String?   @db.VarChar(30)
+  appointmentId  String?   @db.VarChar(30)
+  createdAt      DateTime  @default(now()) @db.DateTime(3)
+  updatedAt      DateTime  @updatedAt @db.DateTime(3)
+
+  template    SmsTemplate? @relation(fields: [templateId], references: [id])
+  department  Department?  @relation(fields: [departmentId], references: [id])
+
+  @@index([status])
+  @@index([provider])
+  @@index([templateId])
+  @@index([departmentId])
+  @@index([recipientPhone])
+  @@index([createdAt])
+  @@map("sms_logs")
+}
+
+model SmsCampaign {
+  id             String    @id @default(cuid())
+  name           String    @db.VarChar(200)
+  templateId     String    @db.VarChar(30)
+  type           String    @db.VarChar(20) // "MANUAL" | "AUTOMATED"
+  status         String    @default("DRAFT") @db.VarChar(20) // "DRAFT" | "SCHEDULED" | "RUNNING" | "COMPLETED" | "PAUSED"
+  scheduleAt     DateTime? @db.DateTime(3)
+  targetGroup    String?   @db.VarChar(50) // "ALL_PATIENTS" | "DEPARTMENT" | "CUSTOM"
+  targetCriteria String?   @default("{}") @db.Text // JSON filter criteria
+  totalSent      Int       @default(0)
+  totalDelivered Int       @default(0)
+  totalFailed    Int       @default(0)
+  createdAt      DateTime  @default(now()) @db.DateTime(3)
+  updatedAt      DateTime  @updatedAt @db.DateTime(3)
+
+  template SmsTemplate @relation(fields: [templateId], references: [id])
+
+  @@index([status])
+  @@index([templateId])
+  @@index([scheduleAt])
+  @@map("sms_campaigns")
+}
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String   @db.VarChar(30)
+  title     String   @db.VarChar(200)
+  message   String   @db.Text
+  type      String   @db.VarChar(20) // "INFO" | "WARNING" | "SUCCESS" | "ERROR" | "SURVEY" | "SMS"
+  isRead    Boolean  @default(false)
+  link      String?  @db.VarChar(500)
+  createdAt DateTime @default(now()) @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([isRead])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// ============================================
+// ATTACHMENTS
+// ============================================
+
+model Attachment {
+  id         String   @id @default(cuid())
+  userId     String?  @db.VarChar(30)
+  entityType String   @db.VarChar(30) // "SURVEY" | "RESPONSE" | "SMS" | "REPORT"
+  entityId   String   @db.VarChar(30) // ID of the related entity
+  fileName   String   @db.VarChar(255)
+  fileUrl    String   @db.VarChar(500)
+  fileType   String   @db.VarChar(100) // MIME type
+  fileSize   Int      // bytes
+  createdAt  DateTime @default(now()) @db.DateTime(3)
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@map("attachments")
+}
+
+// ============================================
+// AUDIT LOGS
+// ============================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?  @db.VarChar(30)
+  action     String   @db.VarChar(30) // "CREATE" | "UPDATE" | "DELETE" | "LOGIN" | "LOGOUT" | "EXPORT"
+  entityType String?  @db.VarChar(30) // "SURVEY" | "USER" | "DEPARTMENT" | "SMS" | etc.
+  entityId   String?  @db.VarChar(30)
+  details    String   @default("{}") @db.Text // JSON details
+  ipAddress  String?  @db.VarChar(45)
+  userAgent  String?  @db.Text
+  createdAt  DateTime @default(now()) @db.DateTime(3)
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([action])
+  @@index([entityType])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================
+// ANALYTICS CACHE
+// ============================================
+
+model AnalyticsCache {
+  id        String   @id @default(cuid())
+  key       String   @unique @db.VarChar(200)
+  data      String   @default("{}") @db.LongText // JSON data
+  expiresAt DateTime @db.DateTime(3)
+  createdAt DateTime @default(now()) @db.DateTime(3)
+  updatedAt DateTime @updatedAt @db.DateTime(3)
+
+  @@index([key])
+  @@index([expiresAt])
+  @@map("analytics_cache")
+}
+
+// ============================================
+// INTEGRATIONS
+// ============================================
+
+model Integration {
+  id          String    @id @default(cuid())
+  name        String    @db.VarChar(200)
+  type        String    @db.VarChar(50) // "SMS_TWILIO" | "SMS_MSG91" | "SMS_TEXTLOCAL" | "CONCEPT_SOFTWARE" | "WEBHOOK"
+  config      String    @default("{}") @db.Text // JSON config (encrypted sensitive data)
+  isActive    Boolean   @default(false)
+  lastSyncAt  DateTime? @db.DateTime(3)
+  createdAt   DateTime  @default(now()) @db.DateTime(3)
+  updatedAt   DateTime  @updatedAt @db.DateTime(3)
+
+  @@index([type])
+  @@index([isActive])
+  @@map("integrations")
+}
+
+// ============================================
+// SYSTEM SETTINGS
+// ============================================
+
+model SystemSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique @db.VarChar(100)
+  value     String   @db.Text
+  category  String   @default("GENERAL") @db.VarChar(30) // "GENERAL" | "SMS" | "EMAIL" | "SECURITY" | "INTEGRATION"
+  createdAt DateTime @default(now()) @db.DateTime(3)
+  updatedAt DateTime @updatedAt @db.DateTime(3)
+
+  @@index([key])
+  @@index([category])
+  @@map("system_settings")
+}
