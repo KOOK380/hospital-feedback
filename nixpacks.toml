@@ -1,0 +1,10 @@
+[phases.setup]
+
+[phases.install]
+cmd = "npm install"
+
+[phases.build]
+cmd = "bash prisma/railway-build.sh"
+
+[start]
+cmd = "npx next start -p $PORT"
