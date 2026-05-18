@@ -2,37 +2,28 @@
 # =============================================================================
 # Railway / Docker Startup Script
 # =============================================================================
-
-set -e
+# This script runs BEFORE the Next.js server starts.
+# It tries to create tables and seed data, but ALWAYS starts the server.
+# =============================================================================
 
 echo "🚀 Starting Hospital Survey System..."
 
-if [ -z "$DATABASE_URL" ]; then
-  echo "❌ ERROR: DATABASE_URL environment variable is not set!"
-  echo "   Please add DATABASE_URL in Railway → Variables"
-  echo "   Starting server anyway (setup endpoint will be available)..."
+# ---- Step 1: Try to create database tables ----
+if [ -n "$DATABASE_URL" ]; then
+  echo "📊 DATABASE_URL is set. Setting up database..."
+
+  echo "📦 Creating database tables..."
+  npx prisma db push --accept-data-loss 2>&1 || echo "⚠️  prisma db push failed (tables may already exist)"
+
+  echo "🌱 Seeding database..."
+  npx tsx prisma/seed-production.ts 2>&1 || echo "⚠️  Seeding failed (data may already exist)"
 else
-  echo "📊 DATABASE_URL is set (length: $(echo -n "$DATABASE_URL" | wc -c) chars)"
-
-  echo ""
-  echo "📦 Step 1: Creating database tables (prisma db push)..."
-  npx prisma db push --accept-data-loss 2>&1 || {
-    echo "⚠️  prisma db push failed, but continuing (tables may already exist)"
-  }
-
-  echo ""
-  echo "🌱 Step 2: Seeding database with demo data..."
-  npx tsx prisma/seed-production.ts 2>&1 || {
-    echo "⚠️  Seeding had issues (data may already exist), continuing..."
-  }
+  echo "⚠️  DATABASE_URL not set. Skipping database setup."
+  echo "   You can set it in Railway → Variables, then visit /api/setup"
 fi
 
+# ---- Step 2: Start the Next.js server ----
+# This MUST always run, even if DB setup failed above
 echo ""
-echo "🌐 Step 3: Starting Next.js server on port ${PORT:-3000}..."
-if [ -f "server.js" ]; then
-  echo "   Using standalone server.js"
-  exec node server.js
-else
-  echo "   Using next start"
-  exec npx next start -p ${PORT:-3000}
-fi
+echo "🌐 Starting Next.js server on port ${PORT:-3000}..."
+exec npx next start -p ${PORT:-3000} -H 0.0.0.0

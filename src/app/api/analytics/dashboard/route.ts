@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { verifyToken } from '@/lib/auth'
 
+export const dynamic = 'force-dynamic'
+
 export async function GET(request: NextRequest) {
   try {
     const authUser = verifyToken(request)
@@ -9,130 +11,175 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Total surveys & active surveys
-    const [totalSurveys, activeSurveys] = await Promise.all([
+    // Run independent queries in parallel for speed
+    const [
+      totalSurveys,
+      activeSurveys,
+      totalResponses,
+      completedResponses,
+      patientRatingAgg,
+      employeeRatingAgg,
+      patientSurveyCount,
+      employeeSurveyCount,
+      patientResponseCount,
+      employeeResponseCount,
+      totalSms,
+      sentSms,
+      deliveredSms,
+      failedSms,
+    ] = await Promise.all([
       db.survey.count({ where: { deletedAt: null } }),
       db.survey.count({ where: { deletedAt: null, isActive: true } }),
-    ])
-
-    // Total responses & completed
-    const [totalResponses, completedResponses] = await Promise.all([
       db.surveyResponse.count(),
       db.surveyResponse.count({ where: { status: 'COMPLETED' } }),
+      db.surveyResponse.aggregate({
+        where: { survey: { type: 'PATIENT' }, overallRating: { not: null } },
+        _avg: { overallRating: true },
+        _count: true,
+      }),
+      db.surveyResponse.aggregate({
+        where: { survey: { type: 'EMPLOYEE' }, overallRating: { not: null } },
+        _avg: { overallRating: true },
+        _count: true,
+      }),
+      db.survey.count({ where: { type: 'PATIENT', deletedAt: null } }),
+      db.survey.count({ where: { type: 'EMPLOYEE', deletedAt: null } }),
+      db.surveyResponse.count({ where: { survey: { type: 'PATIENT' } } }),
+      db.surveyResponse.count({ where: { survey: { type: 'EMPLOYEE' } } }),
+      db.smsLog.count(),
+      db.smsLog.count({ where: { status: 'SENT' } }),
+      db.smsLog.count({ where: { status: 'DELIVERED' } }),
+      db.smsLog.count({ where: { status: 'FAILED' } }),
     ])
-
-    // Average ratings using aggregation
-    const patientRatingAgg = await db.surveyResponse.aggregate({
-      where: { survey: { type: 'PATIENT' }, overallRating: { not: null } },
-      _avg: { overallRating: true },
-      _count: true,
-    })
-
-    const employeeRatingAgg = await db.surveyResponse.aggregate({
-      where: { survey: { type: 'EMPLOYEE' }, overallRating: { not: null } },
-      _avg: { overallRating: true },
-      _count: true,
-    })
 
     const patientAvgRating = patientRatingAgg._avg.overallRating ?? 0
     const employeeAvgRating = employeeRatingAgg._avg.overallRating ?? 0
 
-    // Star rating distribution using raw SQL for efficiency
-    // Group by answerNumber (rounded) and survey type
-    const patientStarDist = await db.$queryRaw<Array<{ rating: number; count: bigint }>>`
-      SELECT ROUND(sa.answerNumber) as rating, COUNT(*) as count
-      FROM survey_answers sa
-      JOIN survey_questions sq ON sa.questionId = sq.id
-      JOIN surveys s ON sq.surveyId = s.id
-      WHERE sq.questionType = 'STAR_RATING'
-        AND s.type = 'PATIENT'
-        AND sa.answerNumber IS NOT NULL
-        AND ROUND(sa.answerNumber) BETWEEN 1 AND 5
-      GROUP BY ROUND(sa.answerNumber)
-      ORDER BY rating
-    `
+    // Date range for recent trend
+    const sevenDaysAgo = new Date()
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
 
-    const employeeStarDist = await db.$queryRaw<Array<{ rating: number; count: bigint }>>`
-      SELECT ROUND(sa.answerNumber) as rating, COUNT(*) as count
-      FROM survey_answers sa
-      JOIN survey_questions sq ON sa.questionId = sq.id
-      JOIN surveys s ON sq.surveyId = s.id
-      WHERE sq.questionType = 'STAR_RATING'
-        AND s.type = 'EMPLOYEE'
-        AND sa.answerNumber IS NOT NULL
-        AND ROUND(sa.answerNumber) BETWEEN 1 AND 5
-      GROUP BY ROUND(sa.answerNumber)
-      ORDER BY rating
-    `
+    // Fetch data for charts — all in parallel
+    const [patientStarAnswers, employeeStarAnswers, deptResponses, recentResponses, allDepartments] =
+      await Promise.all([
+        // Patient star ratings
+        db.surveyAnswer.findMany({
+          where: {
+            question: { questionType: 'STAR_RATING', survey: { type: 'PATIENT' } },
+            answerNumber: { not: null },
+          },
+          select: { answerNumber: true },
+        }),
+        // Employee star ratings
+        db.surveyAnswer.findMany({
+          where: {
+            question: { questionType: 'STAR_RATING', survey: { type: 'EMPLOYEE' } },
+            answerNumber: { not: null },
+          },
+          select: { answerNumber: true },
+        }),
+        // Department responses — fetch with departmentId and survey type
+        db.surveyResponse.findMany({
+          where: { overallRating: { not: null }, departmentId: { not: null } },
+          select: {
+            overallRating: true,
+            departmentId: true,
+            survey: { select: { type: true } },
+          },
+        }),
+        // Recent responses (last 7 days)
+        db.surveyResponse.findMany({
+          where: { submittedAt: { gte: sevenDaysAgo } },
+          select: {
+            submittedAt: true,
+            survey: { select: { type: true } },
+          },
+        }),
+        // All active departments for mapping
+        db.department.findMany({
+          where: { isActive: true },
+          select: { id: true, name: true, code: true },
+        }),
+      ])
 
-    const buildDistFromRaw = (raw: Array<{ rating: number; count: bigint }>) => {
+    // Build department lookup map
+    const deptLookup = new Map(allDepartments.map(d => [d.id, d]))
+
+    // Build star rating distributions
+    const buildDist = (answers: { answerNumber: number | null }[]) => {
       const dist: Record<string, number> = { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0 }
-      for (const row of raw) {
-        dist[String(row.rating)] = Number(row.count)
+      for (const a of answers) {
+        const rating = Math.round(a.answerNumber || 0)
+        if (rating >= 1 && rating <= 5) {
+          dist[String(rating)]++
+        }
       }
       return dist
     }
 
-    const patientRatingDistribution = buildDistFromRaw(patientStarDist)
-    const employeeRatingDistribution = buildDistFromRaw(employeeStarDist)
+    const patientRatingDistribution = buildDist(patientStarAnswers)
+    const employeeRatingDistribution = buildDist(employeeStarAnswers)
 
-    // Department-wise average ratings using raw SQL
-    const deptRatings = await db.$queryRaw<Array<{
-      departmentId: string
-      departmentName: string
-      departmentCode: string
-      totalResponses: bigint
-      patientAvg: number | null
-      employeeAvg: number | null
-      overallAvg: number
-    }>>`
-      SELECT
-        d.id as departmentId,
-        d.name as departmentName,
-        d.code as departmentCode,
-        COUNT(sr.id) as totalResponses,
-        AVG(CASE WHEN s.type = 'PATIENT' THEN sr.overallRating END) as patientAvg,
-        AVG(CASE WHEN s.type = 'EMPLOYEE' THEN sr.overallRating END) as employeeAvg,
-        AVG(sr.overallRating) as overallAvg
-      FROM departments d
-      JOIN survey_responses sr ON sr.departmentId = d.id
-      JOIN surveys s ON sr.surveyId = s.id
-      WHERE d.isActive = 1 AND sr.overallRating IS NOT NULL
-      GROUP BY d.id, d.name, d.code
-      ORDER BY overallAvg DESC
-    `
+    // Build department ratings — group by departmentId in JS
+    const deptMap = new Map<string, {
+      name: string
+      code: string
+      totalResponses: number
+      patientRatings: number[]
+      employeeRatings: number[]
+    }>()
 
-    const departmentRatings = deptRatings.map(dr => ({
-      departmentId: dr.departmentId,
-      departmentName: dr.departmentName,
-      departmentCode: dr.departmentCode,
-      totalResponses: Number(dr.totalResponses),
-      patientAvgRating: dr.patientAvg !== null ? Math.round(dr.patientAvg * 100) / 100 : null,
-      employeeAvgRating: dr.employeeAvg !== null ? Math.round(dr.employeeAvg * 100) / 100 : null,
-      overallAvgRating: Math.round(dr.overallAvg * 100) / 100,
-    }))
+    for (const r of deptResponses) {
+      if (!r.departmentId) continue
+      const dept = deptLookup.get(r.departmentId)
+      if (!dept) continue
 
-    // Recent responses trend (last 7 days) using raw SQL
-    const trendRaw = await db.$queryRaw<Array<{
-      date: string
-      total: bigint
-      patient: bigint
-      employee: bigint
-    }>>`
-      SELECT
-        DATE(sr.submittedAt) as date,
-        COUNT(*) as total,
-        SUM(CASE WHEN s.type = 'PATIENT' THEN 1 ELSE 0 END) as patient,
-        SUM(CASE WHEN s.type = 'EMPLOYEE' THEN 1 ELSE 0 END) as employee
-      FROM survey_responses sr
-      JOIN surveys s ON sr.surveyId = s.id
-      WHERE sr.submittedAt >= DATE('now', '-7 days')
-      GROUP BY DATE(sr.submittedAt)
-      ORDER BY date
-    `
+      if (!deptMap.has(dept.id)) {
+        deptMap.set(dept.id, {
+          name: dept.name,
+          code: dept.code,
+          totalResponses: 0,
+          patientRatings: [],
+          employeeRatings: [],
+        })
+      }
+
+      const d = deptMap.get(dept.id)!
+      d.totalResponses++
+      if (r.survey.type === 'PATIENT') {
+        d.patientRatings.push(r.overallRating!)
+      } else {
+        d.employeeRatings.push(r.overallRating!)
+      }
+    }
+
+    const departmentRatings = Array.from(deptMap.entries()).map(([id, d]) => {
+      const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+      return {
+        departmentId: id,
+        departmentName: d.name,
+        departmentCode: d.code,
+        totalResponses: d.totalResponses,
+        patientAvgRating: d.patientRatings.length > 0 ? Math.round(avg(d.patientRatings) * 100) / 100 : null,
+        employeeAvgRating: d.employeeRatings.length > 0 ? Math.round(avg(d.employeeRatings) * 100) / 100 : null,
+        overallAvgRating: Math.round(avg([...d.patientRatings, ...d.employeeRatings]) * 100) / 100,
+      }
+    }).sort((a, b) => b.overallAvgRating - a.overallAvgRating)
+
+    // Build recent trend (last 7 days)
+    const trendMap = new Map<string, { total: number; patient: number; employee: number }>()
+    for (const r of recentResponses) {
+      const dateStr = r.submittedAt.toISOString().split('T')[0]
+      if (!trendMap.has(dateStr)) {
+        trendMap.set(dateStr, { total: 0, patient: 0, employee: 0 })
+      }
+      const t = trendMap.get(dateStr)!
+      t.total++
+      if (r.survey.type === 'PATIENT') t.patient++
+      else t.employee++
+    }
 
     // Fill in missing days
-    const trendMap = new Map(trendRaw.map(t => [t.date, t]))
     const recentTrend = []
     for (let i = 6; i >= 0; i--) {
       const date = new Date()
@@ -141,30 +188,11 @@ export async function GET(request: NextRequest) {
       const existing = trendMap.get(dateStr)
       recentTrend.push({
         date: dateStr,
-        total: existing ? Number(existing.total) : 0,
-        patient: existing ? Number(existing.patient) : 0,
-        employee: existing ? Number(existing.employee) : 0,
+        total: existing ? existing.total : 0,
+        patient: existing ? existing.patient : 0,
+        employee: existing ? existing.employee : 0,
       })
     }
-
-    // Survey type breakdown
-    const [patientSurveyCount, employeeSurveyCount] = await Promise.all([
-      db.survey.count({ where: { type: 'PATIENT', deletedAt: null } }),
-      db.survey.count({ where: { type: 'EMPLOYEE', deletedAt: null } }),
-    ])
-
-    const [patientResponseCount, employeeResponseCount] = await Promise.all([
-      db.surveyResponse.count({ where: { survey: { type: 'PATIENT' } } }),
-      db.surveyResponse.count({ where: { survey: { type: 'EMPLOYEE' } } }),
-    ])
-
-    // SMS stats
-    const [totalSms, sentSms, deliveredSms, failedSms] = await Promise.all([
-      db.smsLog.count(),
-      db.smsLog.count({ where: { status: 'SENT' } }),
-      db.smsLog.count({ where: { status: 'DELIVERED' } }),
-      db.smsLog.count({ where: { status: 'FAILED' } }),
-    ])
 
     return NextResponse.json({
       overview: {
